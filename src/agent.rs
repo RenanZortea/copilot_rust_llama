@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 const MAX_OUTPUT_CHARS: usize = 2000;
+const MAX_LOOPS: usize = 15;
 
 pub struct AgentConfig {
     pub model: String,
@@ -17,7 +18,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "gemma3".to_string(), // Or llama3, mistral
+            model: "gemma3".to_string(), // Ensure this matches your model
         }
     }
 }
@@ -30,7 +31,6 @@ struct OllamaResponse {
     context: Option<Vec<i64>>,
 }
 
-// The structure we expect the AI to output
 #[derive(Deserialize, Serialize, Debug)]
 struct ToolAction {
     thought: String,
@@ -43,35 +43,45 @@ pub async fn run_agent_loop(
     tx: mpsc::Sender<AppEvent>,
 ) -> Result<()> {
     let client = Client::new();
-    let mut shell = ShellSession::new()?; // Start persistent shell
+    let mut shell = ShellSession::new()?;
 
     let mut current_prompt = initial_prompt;
     let mut context: Option<Vec<i64>> = None;
+    let mut loop_count = 0;
 
-    // We force JSON mode in the system prompt
     let system_prompt = r#"
-    You are an AI Agent with a persistent shell.
+    You are an AI Agent with a persistent shell inside a Docker container.
     You MUST respond using strictly valid JSON format.
     
     Format:
     {
-        "thought": "Reasoning about what to do...",
+        "thought": "Reasoning...",
         "command": "shell_command_to_run"
     }
 
-    If you don't need to run a command, set "command" to null.
-    The shell state is persistent (cd works).
+    Rules:
+    1. If you don't need to run a command, set "command": null.
+    2. If the user asks a question, answer in "thought" and set "command": null.
+    3. The shell is persistent.
     "#;
 
-    // Loop for multi-turn Agent actions
     loop {
+        if loop_count >= MAX_LOOPS {
+            tx.send(AppEvent::Error(
+                "Max iterations reached. Stopping loop.".into(),
+            ))
+            .await?;
+            break;
+        }
+        loop_count += 1;
+
         let request_body = json!({
             "model": config.model,
             "prompt": current_prompt,
             "context": context,
             "system": system_prompt,
             "stream": true,
-            "format": "json" // Force Ollama to enforce JSON
+            "format": "json"
         });
 
         let mut stream = client
@@ -83,32 +93,26 @@ pub async fn run_agent_loop(
 
         let mut full_json_buffer = String::new();
 
-        // 1. Stream the raw JSON to the UI (so user sees it typing)
         while let Some(item) = stream.next().await {
             let chunk = item?;
             if let Ok(json_resp) = serde_json::from_slice::<OllamaResponse>(&chunk) {
                 tx.send(AppEvent::Token(json_resp.response.clone())).await?;
                 full_json_buffer.push_str(&json_resp.response);
-
                 if json_resp.done {
                     context = json_resp.context;
                 }
             }
         }
 
-        // 2. Parse the accumulated JSON
         let action: ToolAction = match serde_json::from_str(&full_json_buffer) {
             Ok(a) => a,
             Err(_) => {
-                // Fallback: sometimes models write text before JSON or mess up.
-                // For now, we report error and stop.
-                tx.send(AppEvent::Error("Failed to parse AI JSON response.".into()))
+                tx.send(AppEvent::Error("Failed to parse JSON. Stopping.".into()))
                     .await?;
                 break;
             }
         };
 
-        // 3. Execute Command if present
         if let Some(cmd) = action.command {
             if cmd.trim().is_empty() {
                 break;
@@ -116,24 +120,20 @@ pub async fn run_agent_loop(
 
             tx.send(AppEvent::CommandStart(cmd.clone())).await?;
 
-            // Run in Persistent Shell
-            let mut output = shell.run_command(&cmd).await?;
+            // Pass 'tx' here for live streaming!
+            let mut output = shell.run_command(&cmd, &tx).await?;
 
-            // 4. Truncate Output
             if output.len() > MAX_OUTPUT_CHARS {
-                output = format!(
-                    "{}\n\n... [Output Truncated: showing first {} chars] ...",
-                    &output[..MAX_OUTPUT_CHARS],
-                    MAX_OUTPUT_CHARS
-                );
+                output = format!("{}\n\n... [Truncated] ...", &output[..MAX_OUTPUT_CHARS]);
             }
 
             tx.send(AppEvent::CommandEnd(output.clone())).await?;
 
-            // Feed output back to AI
-            current_prompt = format!("Command Output:\n{}", output);
+            current_prompt = format!(
+                "Command Output:\n{}\n\nIs the task done? If yes, respond with command: null.",
+                output
+            );
         } else {
-            // No command means the AI is done talking
             break;
         }
     }

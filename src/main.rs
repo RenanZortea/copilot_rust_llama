@@ -2,7 +2,7 @@ mod agent;
 mod app;
 mod docker_setup;
 mod shell;
-mod ui; // Add this
+mod ui;
 
 use anyhow::Result;
 use app::{App, AppEvent};
@@ -17,8 +17,7 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 0. Ensure Docker Environment is Ready
-    // This will create ./workspace and start the container
+    // 0. Ensure Docker Environment
     docker_setup::ensure_docker_env()?;
 
     // 1. Setup Terminal
@@ -32,7 +31,7 @@ async fn main() -> Result<()> {
     let (tx_key_event, mut rx_key_event) = mpsc::unbounded_channel();
 
     std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(250)).expect("Failed to poll") {
+        if event::poll(Duration::from_millis(100)).expect("Failed to poll") {
             if let Ok(evt) = event::read() {
                 if tx_key_event.send(evt).is_err() {
                     break;
@@ -53,7 +52,7 @@ async fn main() -> Result<()> {
                     Event::Key(key) => {
                         match key.code {
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                            KeyCode::Esc => break,
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                             _ => app.handle_key_event(key),
                         }
                     }

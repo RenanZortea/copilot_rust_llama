@@ -39,10 +39,6 @@ pub fn ensure_docker_env() -> Result<()> {
     println!("Starting Docker Sandbox...");
 
     // 4. Run the container
-    // -d: Detached (background)
-    // -v: Volume mount (Local PWD/workspace -> /workspace)
-    // -w: Working directory
-    // tail -f /dev/null: Keeps the container running forever so we can exec into it
     let current_dir = std::env::current_dir()?;
     let abs_workspace = current_dir.join("workspace");
 
@@ -55,7 +51,7 @@ pub fn ensure_docker_env() -> Result<()> {
         .arg(format!("{}:/workspace", abs_workspace.to_string_lossy()))
         .arg("-w")
         .arg("/workspace")
-        .arg("ubuntu:latest") // You can switch this to python:3.9 or node:18
+        .arg("ubuntu:latest")
         .args(["tail", "-f", "/dev/null"])
         .status()?;
 
@@ -63,6 +59,22 @@ pub fn ensure_docker_env() -> Result<()> {
         return Err(anyhow!(
             "Failed to start Docker container. Is Docker running?"
         ));
+    }
+
+    // 5. NEW: Install basic tools (curl, git, etc.) immediately after start
+    println!("Installing basic tools (curl, git, vim)... this may take a moment.");
+    let setup = Command::new("docker")
+        .args([
+            "exec",
+            CONTAINER_NAME,
+            "bash",
+            "-c",
+            "apt-get update && apt-get install -y curl git vim nano wget",
+        ])
+        .status()?;
+
+    if !setup.success() {
+        eprintln!("Warning: Failed to install basic tools.");
     }
 
     println!("Docker Sandbox started successfully!");

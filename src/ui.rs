@@ -1,128 +1,147 @@
-use crate::app::{App, MessageRole};
+use crate::app::{App, AppMode, MessageRole};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 use textwrap::wrap;
 
 pub fn draw(f: &mut Frame, app: &App) {
-    // Split screen: Top (Chat), Bottom (Input)
+    // 1. Vertical Layout (Header/Tabs -> Content -> Input)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),    // Chat history takes available space
-            Constraint::Length(3), // Input box fixed height
+            Constraint::Length(3), // Tabs
+            Constraint::Min(1),    // Main Content
+            Constraint::Length(3), // Input
         ])
         .split(f.size());
 
-    // Calculate available width for text
-    // Width - 2 (borders) - 2 (padding/prefixes approx)
-    let max_width = (chunks[0].width.saturating_sub(4)) as usize;
+    draw_tabs(f, app, chunks[0]);
 
-    // --- Chat Area ---
-    let messages: Vec<ListItem> = app
+    match app.mode {
+        AppMode::Chat => draw_chat(f, app, chunks[1]),
+        AppMode::Terminal => draw_terminal(f, app, chunks[1]),
+    }
+
+    draw_input(f, app, chunks[2]);
+}
+
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles = vec![" Chat ", " Terminal "];
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::BOTTOM))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .select(match app.mode {
+            AppMode::Chat => 0,
+            AppMode::Terminal => 1,
+        });
+    f.render_widget(tabs, area);
+}
+
+fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
+    // Minimal aesthetic: No borders around the list itself, just content
+    let max_width = (area.width.saturating_sub(2)) as usize;
+
+    let items: Vec<ListItem> = app
         .messages
         .iter()
-        .map(|m| {
-            let (prefix, style) = match m.role {
+        .map(|msg| {
+            let (role_str, style) = match msg.role {
                 MessageRole::User => (
-                    "User: ",
+                    "YOU",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                MessageRole::Assistant => ("AI: ", Style::default().fg(Color::Green)),
-                MessageRole::System => (
-                    "Sys: ",
+                MessageRole::Assistant => (
+                    "AI",
                     Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::ITALIC),
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                MessageRole::Error => ("Err: ", Style::default().fg(Color::Red)),
+                MessageRole::System => ("SYS", Style::default().fg(Color::DarkGray)),
+                MessageRole::Error => ("ERR", Style::default().fg(Color::Red)),
             };
 
-            let mut lines = vec![];
+            let header = Line::from(Span::styled(role_str, style));
 
-            // 1. First line contains the Prefix + first part of content
-            // We combine them to wrap properly, or just print prefix on line 1
-            let full_text = format!("{}{}", prefix, m.content);
+            // Wrap content
+            let wrapped_lines = wrap(&msg.content, max_width);
+            let mut content_lines = vec![header];
 
-            // Wrap the text
-            let wrapped_lines = wrap(&m.content, max_width);
-
-            if wrapped_lines.is_empty() {
-                // Handle empty message (processing...)
-                lines.push(Line::from(Span::styled(prefix, style)));
-            } else {
-                for (i, line_str) in wrapped_lines.iter().enumerate() {
-                    if i == 0 {
-                        // First line has the prefix
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, style),
-                            Span::raw(line_str.to_string()),
-                        ]));
-                    } else {
-                        // Subsequent lines are indented slightly or just raw
-                        lines.push(Line::from(Span::raw(line_str.to_string())));
-                    }
-                }
+            for line in wrapped_lines {
+                // Slight indent for text
+                content_lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(line.to_string()),
+                ]));
             }
+            content_lines.push(Line::from("")); // Spacing
 
-            // Add spacing after message
-            lines.push(Line::from(""));
-
-            ListItem::new(lines)
+            ListItem::new(content_lines)
         })
         .collect();
 
-    let chat_list = List::new(messages).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Ollama Terminal "),
-    );
+    let chat_list = List::new(items).block(Block::default().borders(Borders::NONE)); // Clean look
 
-    // Automatically scroll to bottom
-    // We count the number of items (messages), not lines, so this works for the List widget
-    let msg_count = app.messages.len();
-    let mut state = app.list_state.clone();
-    if msg_count > 0 {
-        state.select(Some(msg_count - 1));
-    }
+    let mut state = app.chat_scroll.clone();
+    f.render_stateful_widget(chat_list, area, &mut state);
+}
 
-    f.render_stateful_widget(chat_list, chunks[0], &mut state);
+fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .terminal_lines
+        .iter()
+        .map(|line| {
+            ListItem::new(Line::from(Span::styled(
+                line,
+                Style::default().fg(Color::Green), // Retro terminal green
+            )))
+        })
+        .collect();
 
-    // --- Input Area ---
+    let term_list = List::new(items)
+        .block(Block::default().padding(ratatui::widgets::Padding::new(1, 1, 0, 0)));
+
+    let mut state = app.term_scroll.clone();
+    f.render_stateful_widget(term_list, area, &mut state);
+}
+
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let input_style = if app.is_processing {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::White)
     };
 
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Input (Esc to Quit) ")
-        .border_style(if app.is_processing {
-            Style::default().fg(Color::DarkGray)
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(if app.is_processing {
+            " Processing... "
         } else {
-            Style::default().fg(Color::Cyan)
-        });
+            " Message "
+        })
+        .title_style(Style::default().fg(Color::DarkGray));
 
-    // We manually scroll the input if it gets too long
-    // A simple way is to take the last N characters that fit
-    let input_width = (chunks[1].width.saturating_sub(2)) as usize;
-    let input_content = &app.input_buffer;
-    let display_input = if input_content.len() > input_width {
-        &input_content[input_content.len() - input_width..]
+    let scroll_offset = if app.input_buffer.len() > area.width as usize {
+        app.input_buffer.len() - area.width as usize + 5
     } else {
-        input_content
+        0
     };
 
-    let input_text = Paragraph::new(display_input)
-        .style(input_style)
-        .block(input_block);
+    let text_slice = if app.input_buffer.len() > scroll_offset {
+        &app.input_buffer[scroll_offset..]
+    } else {
+        &app.input_buffer
+    };
 
-    f.render_widget(input_text, chunks[1]);
+    let p = Paragraph::new(text_slice).style(input_style).block(block);
+    f.render_widget(p, area);
 }
