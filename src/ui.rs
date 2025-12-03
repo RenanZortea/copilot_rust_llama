@@ -8,16 +8,34 @@ use ratatui::{
 };
 use textwrap::wrap;
 
+const THROBBER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub fn draw(f: &mut Frame, app: &App) {
-    // 1. Vertical Layout (Header/Tabs -> Content -> Input)
+    let area = f.area();
+    let width = area.width.max(3) - 2;
+
+    let mut input_height = 0;
+    for line in app.input_buffer.lines() {
+        let line_len = line.len() as u16;
+        if line_len == 0 {
+            input_height += 1;
+        } else {
+            input_height += (line_len + width - 1) / width;
+        }
+    }
+    if input_height == 0 {
+        input_height = 1;
+    }
+    let constrained_height = (input_height).min(10).max(1) + 2;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tabs
-            Constraint::Min(1),    // Main Content
-            Constraint::Length(3), // Input
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(constrained_height as u16),
         ])
-        .split(f.size());
+        .split(area);
 
     draw_tabs(f, app, chunks[0]);
 
@@ -30,12 +48,17 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles = vec![" Chat ", " Terminal "];
-    let tabs = Tabs::new(titles)
+    let spinner = if app.is_processing {
+        THROBBER[app.spinner_frame % THROBBER.len()]
+    } else {
+        " "
+    };
+    let chat_title = format!("{} Agent ", spinner);
+    let tabs = Tabs::new(vec![chat_title.as_str(), " Terminal "])
         .block(Block::default().borders(Borders::BOTTOM))
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
         .select(match app.mode {
@@ -45,103 +68,166 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
-    // Minimal aesthetic: No borders around the list itself, just content
-    let max_width = (area.width.saturating_sub(2)) as usize;
-
-    let items: Vec<ListItem> = app
-        .messages
-        .iter()
-        .map(|msg| {
-            let (role_str, style) = match msg.role {
-                MessageRole::User => (
-                    "YOU",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                MessageRole::Assistant => (
-                    "AI",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                MessageRole::System => ("SYS", Style::default().fg(Color::DarkGray)),
-                MessageRole::Error => ("ERR", Style::default().fg(Color::Red)),
+fn parse_markdown_line(line: &str, in_code_block: bool) -> (Line<'static>, bool) {
+    if line.trim().starts_with("```") {
+        return (
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+            !in_code_block,
+        );
+    }
+    let mut spans = vec![];
+    let style = if in_code_block {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with("# ") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    if !in_code_block {
+        let parts: Vec<&str> = line.split("**").collect();
+        for (i, part) in parts.iter().enumerate() {
+            let s = if i % 2 == 1 {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
             };
+            spans.push(Span::styled(part.to_string(), s));
+        }
+    } else {
+        spans.push(Span::styled(line.to_string(), style));
+    }
+    (Line::from(spans), in_code_block)
+}
 
-            let header = Line::from(Span::styled(role_str, style));
+fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
+    let max_width = (area.width.saturating_sub(4)) as usize;
+    let mut all_lines = vec![];
 
-            // Wrap content
-            let wrapped_lines = wrap(&msg.content, max_width);
-            let mut content_lines = vec![header];
+    for (i, msg) in app.messages.iter().enumerate() {
+        let (header, h_style) = match msg.role {
+            MessageRole::User => (
+                " USER ",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            MessageRole::Assistant => (
+                " AI ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            MessageRole::System => (
+                " SYS ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            MessageRole::Error => (
+                " ERR ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        };
 
-            for line in wrapped_lines {
-                // Slight indent for text
-                content_lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(line.to_string()),
-                ]));
+        all_lines.push(Line::from(Span::styled(header, h_style)));
+
+        let content = msg.content.clone();
+        let mut in_code_block = false;
+        let show_cursor = i == app.messages.len() - 1
+            && app.is_processing
+            && matches!(msg.role, MessageRole::Assistant);
+
+        for line in content.lines() {
+            let wrapped = wrap(line, max_width);
+            if wrapped.is_empty() {
+                let (l, next_state) = parse_markdown_line("", in_code_block);
+                in_code_block = next_state;
+                all_lines.push(l);
             }
-            content_lines.push(Line::from("")); // Spacing
+            for w_line in wrapped {
+                let (l, next_state) = parse_markdown_line(&w_line, in_code_block);
+                in_code_block = next_state;
+                all_lines.push(l);
+            }
+        }
 
-            ListItem::new(content_lines)
-        })
-        .collect();
+        if show_cursor && (app.spinner_frame / 5) % 2 == 0 {
+            all_lines.push(Line::from(Span::styled(
+                " ▋",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        all_lines.push(Line::from(""));
+    }
 
-    let chat_list = List::new(items).block(Block::default().borders(Borders::NONE)); // Clean look
+    let total_height = all_lines.len() as u16;
+    let view_height = area.height.saturating_sub(2);
 
-    let mut state = app.chat_scroll.clone();
-    f.render_stateful_widget(chat_list, area, &mut state);
+    let scroll_y = if app.chat_stick_to_bottom {
+        if total_height > view_height {
+            total_height - view_height
+        } else {
+            0
+        }
+    } else {
+        app.chat_scroll
+    };
+
+    let p = Paragraph::new(all_lines)
+        .block(Block::default().borders(Borders::NONE))
+        .scroll((scroll_y, 0));
+
+    f.render_widget(p, area);
 }
 
 fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .terminal_lines
         .iter()
-        .map(|line| {
+        .map(|l| {
             ListItem::new(Line::from(Span::styled(
-                line,
-                Style::default().fg(Color::Green), // Retro terminal green
+                l,
+                Style::default().fg(Color::DarkGray),
             )))
         })
         .collect();
-
-    let term_list = List::new(items)
-        .block(Block::default().padding(ratatui::widgets::Padding::new(1, 1, 0, 0)));
-
+    let list = List::new(items).block(Block::default().borders(Borders::LEFT).title(" Shell "));
     let mut state = app.term_scroll.clone();
-    f.render_stateful_widget(term_list, area, &mut state);
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let input_style = if app.is_processing {
-        Style::default().fg(Color::DarkGray)
+    // CHANGED: Show "Esc to Stop" in red when processing
+    let title = if app.is_processing {
+        " Processing... (Esc to STOP) "
     } else {
-        Style::default().fg(Color::White)
+        match app.mode {
+            AppMode::Chat => " Message Agent (Alt+Enter for newline) ",
+            AppMode::Terminal => " Manual Terminal Command ",
+        }
     };
 
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(if app.is_processing {
-            " Processing... "
-        } else {
-            " Message "
-        })
-        .title_style(Style::default().fg(Color::DarkGray));
-
-    let scroll_offset = if app.input_buffer.len() > area.width as usize {
-        app.input_buffer.len() - area.width as usize + 5
+    let border_style = if app.is_processing {
+        Style::default().fg(Color::Red) // Red border when busy
     } else {
-        0
+        match app.mode {
+            AppMode::Chat => Style::default().fg(Color::Cyan),
+            AppMode::Terminal => Style::default().fg(Color::Green),
+        }
     };
 
-    let text_slice = if app.input_buffer.len() > scroll_offset {
-        &app.input_buffer[scroll_offset..]
-    } else {
-        &app.input_buffer
-    };
-
-    let p = Paragraph::new(text_slice).style(input_style).block(block);
+    let p = Paragraph::new(app.input_buffer.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        )
+        .wrap(Wrap { trim: true });
     f.render_widget(p, area);
 }
