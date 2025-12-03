@@ -68,7 +68,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn parse_markdown_line(line: &str, in_code_block: bool) -> (Line<'static>, bool) {
+fn parse_markdown_line(line: &str, in_code_block: bool, base_style: Style) -> (Line<'static>, bool) {
     if line.trim().starts_with("```") {
         return (
             Line::from(Span::styled(
@@ -79,6 +79,8 @@ fn parse_markdown_line(line: &str, in_code_block: bool) -> (Line<'static>, bool)
         );
     }
     let mut spans = vec![];
+    
+    // If we are in a code block, use Green. Otherwise use the base style passed in (Gray for User/Thinking, Yellow for AI)
     let style = if in_code_block {
         Style::default().fg(Color::Green)
     } else if line.starts_with("# ") {
@@ -86,8 +88,9 @@ fn parse_markdown_line(line: &str, in_code_block: bool) -> (Line<'static>, bool)
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        base_style
     };
+
     if !in_code_block {
         let parts: Vec<&str> = line.split("**").collect();
         for (i, part) in parts.iter().enumerate() {
@@ -109,28 +112,31 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let mut all_lines = vec![];
 
     for (i, msg) in app.messages.iter().enumerate() {
-        let (header, h_style) = match msg.role {
+        let (header, h_style, content_style) = match msg.role {
             MessageRole::User => (
                 " USER ",
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Gray),
             ),
             MessageRole::Assistant => (
                 " AI ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            ),
+            MessageRole::Thinking => (
+                " THINK ",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ),
             MessageRole::System => (
                 " SYS ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::DarkGray),
             ),
             MessageRole::Error => (
                 " ERR ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red),
             ),
         };
 
@@ -140,17 +146,17 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         let mut in_code_block = false;
         let show_cursor = i == app.messages.len() - 1
             && app.is_processing
-            && matches!(msg.role, MessageRole::Assistant);
+            && matches!(msg.role, MessageRole::Assistant | MessageRole::Thinking);
 
         for line in content.lines() {
             let wrapped = wrap(line, max_width);
             if wrapped.is_empty() {
-                let (l, next_state) = parse_markdown_line("", in_code_block);
+                let (l, next_state) = parse_markdown_line("", in_code_block, content_style);
                 in_code_block = next_state;
                 all_lines.push(l);
             }
             for w_line in wrapped {
-                let (l, next_state) = parse_markdown_line(&w_line, in_code_block);
+                let (l, next_state) = parse_markdown_line(&w_line, in_code_block, content_style);
                 in_code_block = next_state;
                 all_lines.push(l);
             }
@@ -202,7 +208,6 @@ fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    // CHANGED: Show "Esc to Stop" in red when processing
     let title = if app.is_processing {
         " Processing... (Esc to STOP) "
     } else {
@@ -213,7 +218,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let border_style = if app.is_processing {
-        Style::default().fg(Color::Red) // Red border when busy
+        Style::default().fg(Color::Red)
     } else {
         match app.mode {
             AppMode::Chat => Style::default().fg(Color::Cyan),

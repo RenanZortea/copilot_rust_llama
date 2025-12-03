@@ -18,7 +18,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "gemma3".to_string(),
+            model: "qwen3:8b".to_string(), 
         }
     }
 }
@@ -39,68 +39,126 @@ struct FileOp {
 
 #[derive(Deserialize, Serialize, Debug)]
 struct ToolAction {
-    thought: String,
+    thought: Option<String>, 
     command: Option<String>,
     write_file: Option<FileOp>,
+    path: Option<String>,
+    content: Option<String>,
 }
 
 struct StreamFilter {
-    full_buffer: String,
-    last_thought_len: usize,
+    full_buffer: String,     // Keeps history for JSON parsing
+    parse_buffer: String,    // Keeps active text for tag detection
+    in_think_block: bool,
 }
 
 impl StreamFilter {
     fn new() -> Self {
         Self {
             full_buffer: String::new(),
-            last_thought_len: 0,
+            parse_buffer: String::new(),
+            in_think_block: false,
         }
     }
 
-    fn push(&mut self, chunk: &str) -> Option<String> {
+    fn push(&mut self, chunk: &str) -> Vec<(bool, String)> {
         self.full_buffer.push_str(chunk);
-        if let Some(start_idx) = self.full_buffer.find("\"thought\": \"") {
-            let content_start = start_idx + 12;
-            let mut current_len = 0;
-            let mut escape = false;
-            let chars: Vec<char> = self.full_buffer[content_start..].chars().collect();
-
-            for c in chars {
-                if escape {
-                    escape = false;
-                    current_len += 1;
-                    continue;
+        self.parse_buffer.push_str(chunk);
+        
+        let mut events = Vec::new();
+        
+        // Loop to process all complete tags in the buffer
+        loop {
+            if self.in_think_block {
+                // Looking for closing tag </think>
+                match self.parse_buffer.find("</think>") {
+                    Some(idx) => {
+                        // Found it! Emit everything before it as thinking
+                        let content = self.parse_buffer[..idx].to_string();
+                        if !content.is_empty() {
+                            events.push((true, content));
+                        }
+                        // Remove the tag and everything before it
+                        self.parse_buffer = self.parse_buffer[idx + 8..].to_string();
+                        self.in_think_block = false;
+                    },
+                    None => {
+                        // No closing tag yet.
+                        // We must be careful not to flush a partial closing tag like "</thi"
+                        // The max length of the tag is 8 ("</think>").
+                        // Keep the last 7 chars in the buffer just in case.
+                        let safe_len = self.parse_buffer.len().saturating_sub(7);
+                        if safe_len > 0 {
+                            let safe_chunk = self.parse_buffer[..safe_len].to_string();
+                            events.push((true, safe_chunk));
+                            self.parse_buffer = self.parse_buffer[safe_len..].to_string();
+                        }
+                        break;
+                    }
                 }
-                if c == '\\' {
-                    escape = true;
-                    current_len += 1;
-                    continue;
+            } else {
+                // Looking for opening tag <think>
+                match self.parse_buffer.find("<think>") {
+                    Some(idx) => {
+                        // Found start! Emit everything before it as normal token
+                        let content = self.parse_buffer[..idx].to_string();
+                        if !content.is_empty() {
+                            events.push((false, content));
+                        }
+                        // Remove the tag and everything before it
+                        self.parse_buffer = self.parse_buffer[idx + 7..].to_string();
+                        self.in_think_block = true;
+                    },
+                    None => {
+                        // No opening tag yet.
+                        // Keep potential partial tag like "<thi"
+                        // <think> is 7 chars. Keep last 6.
+                        let safe_len = self.parse_buffer.len().saturating_sub(6);
+                        if safe_len > 0 {
+                            let safe_chunk = self.parse_buffer[..safe_len].to_string();
+                            events.push((false, safe_chunk));
+                            self.parse_buffer = self.parse_buffer[safe_len..].to_string();
+                        }
+                        break;
+                    }
                 }
-                if c == '"' {
-                    break;
-                }
-                current_len += 1;
-            }
-
-            if current_len > self.last_thought_len {
-                let new_part = &self.full_buffer
-                    [content_start + self.last_thought_len..content_start + current_len];
-                self.last_thought_len = current_len;
-                return Some(new_part.replace("\\n", "\n").replace("\\\"", "\""));
             }
         }
-        None
+        
+        events
     }
 }
 
-// --- NEW HELPER: Extract JSON from Markdown/Text ---
-fn clean_json(input: &str) -> Option<&str> {
-    let start = input.find('{')?;
-    let end = input.rfind('}')?;
-    if start > end {
-        return None;
+fn extract_json_candidate(input: &str) -> Option<String> {
+    let starts: Vec<_> = input.match_indices('{').map(|(i, _)| i).collect();
+    if starts.is_empty() { return None; }
+
+    for start in starts.into_iter().rev() {
+        let mut depth = 0;
+        let mut end_idx = None;
+        
+        for (i, c) in input[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end) = end_idx {
+            let candidate = &input[start..=end];
+            if candidate.contains("\"command\"") || candidate.contains("\"write_file\"") || candidate.contains("\"path\"") {
+                return Some(candidate.to_string());
+            }
+        }
     }
-    Some(&input[start..=end])
+    None
 }
 
 pub async fn run_agent_loop(
@@ -115,18 +173,21 @@ pub async fn run_agent_loop(
     let mut loop_count = 0;
 
     let system_prompt = r#"
-    You are an AI Agent with a persistent shell inside a Docker container.
-    The current working directory is /workspace.
-    
+    You are an AI Agent.
     TOOLS:
-    1. "write_file": Create/Overwrite files. NO 'cat >'.
-    2. "command": Run shell commands. 'cat' allowed for reading.
+    1. "write_file": { "path": "filename", "content": "file content" }
+    2. "command": "shell command string"
 
-    Format (JSON):
+    INSTRUCTIONS:
+    1. First, THINK about the problem using <think>...</think> tags.
+    2. Then, output a SINGLE JSON object with your action.
+    
+    EXAMPLE:
+    <think>
+    I need to check the current directory.
+    </think>
     {
-        "thought": "Reasoning...",
-        "command": "ls -la",
-        "write_file": null
+        "command": "ls -la"
     }
     "#;
 
@@ -143,7 +204,6 @@ pub async fn run_agent_loop(
             "context": context,
             "system": system_prompt,
             "stream": true,
-            "format": "json"
         });
 
         let mut stream = client
@@ -158,80 +218,85 @@ pub async fn run_agent_loop(
         while let Some(item) = stream.next().await {
             let chunk = item?;
             if let Ok(json_resp) = serde_json::from_slice::<OllamaResponse>(&chunk) {
-                if let Some(clean_text) = filter.push(&json_resp.response) {
-                    tx_app.send(AppEvent::Token(clean_text)).await?;
+                let events = filter.push(&json_resp.response);
+                for (is_thinking, text) in events {
+                    if is_thinking {
+                        tx_app.send(AppEvent::Thinking(text)).await?;
+                    } else {
+                        tx_app.send(AppEvent::Token(text)).await?;
+                    }
                 }
-                if json_resp.done {
-                    context = json_resp.context;
-                }
+                if json_resp.done { context = json_resp.context; }
             }
         }
 
-        // --- FIXED PARSING LOGIC ---
-        let json_candidate = clean_json(&filter.full_buffer).unwrap_or("{}");
+        let json_candidate = extract_json_candidate(&filter.full_buffer).unwrap_or("{}".to_string());
+        let raw_value: serde_json::Value = serde_json::from_str(&json_candidate).unwrap_or(json!({}));
+        
+        let mut final_path = None;
+        let mut final_content = None;
+        let mut final_cmd = None;
 
-        let action: ToolAction = match serde_json::from_str(json_candidate) {
-            Ok(a) => a,
-            Err(e) => {
-                // If it fails, log the raw output to help debug, then stop
-                let err_msg = format!("JSON Error: {}. Raw: {}", e, filter.full_buffer);
-                tx_app.send(AppEvent::Error(err_msg)).await?;
-                break;
+        if let Some(obj) = raw_value.get("write_file").and_then(|v| v.as_object()) {
+            if let (Some(p), Some(c)) = (obj.get("path").and_then(|v| v.as_str()), obj.get("content").and_then(|v| v.as_str())) {
+                final_path = Some(p.to_string());
+                final_content = Some(c.to_string());
             }
-        };
+        }
+        
+        if final_path.is_none() {
+             if let Some(path_str) = raw_value.get("write_file").and_then(|v| v.as_str()) {
+                 if let Some(content_str) = raw_value.get("content").and_then(|v| v.as_str()) {
+                     final_path = Some(path_str.to_string());
+                     final_content = Some(content_str.to_string());
+                 }
+             }
+        }
+        
+        if let Some(cmd_str) = raw_value.get("command").and_then(|v| v.as_str()) {
+            final_cmd = Some(cmd_str.to_string());
+        }
 
-        if let Some(file_op) = action.write_file {
-            tx_app
-                .send(AppEvent::CommandStart(format!("Writing {}", file_op.path)))
-                .await?;
-            let target_path = Path::new("workspace").join(&file_op.path);
+        if let (Some(path), Some(content)) = (final_path, final_content) {
+            tx_app.send(AppEvent::CommandStart(format!("Writing {}", path))).await?;
+            let target_path = Path::new("workspace").join(&path);
             if let Some(parent) = target_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
 
-            match tokio::fs::write(&target_path, &file_op.content).await {
+            match tokio::fs::write(&target_path, &content).await {
                 Ok(_) => {
-                    tx_app
-                        .send(AppEvent::CommandEnd(format!("Wrote {}", file_op.path)))
-                        .await?;
-                    current_prompt = format!("System: Written {}.", file_op.path);
+                    tx_app.send(AppEvent::CommandEnd(format!("Wrote {}", path))).await?;
+                    current_prompt = format!("System: Written {}.", path);
                 }
                 Err(e) => {
                     tx_app.send(AppEvent::Error(e.to_string())).await?;
                     current_prompt = format!("System Error: {}", e);
                 }
             }
-        } else if let Some(cmd) = action.command {
+        } else if let Some(cmd) = final_cmd {
             let clean = cmd.trim();
-            if clean.is_empty() || clean == "null" {
-                break;
-            }
+            if clean.is_empty() || clean == "null" { break; }
 
             tx_app.send(AppEvent::CommandStart(cmd.clone())).await?;
-
             let (resp_tx, mut resp_rx) = mpsc::channel(100);
-
-            tx_shell
-                .send(ShellRequest::RunCommand {
-                    cmd: cmd.clone(),
-                    response_tx: resp_tx,
-                })
-                .await?;
+            tx_shell.send(ShellRequest::RunCommand { cmd: cmd.clone(), response_tx: resp_tx }).await?;
 
             let mut output = String::new();
             while let Some(line) = resp_rx.recv().await {
                 output.push_str(&line);
                 output.push('\n');
             }
-
-            if output.len() > 5000 {
-                output = format!("{}\n[Truncated]", &output[..5000]);
-            }
+            if output.len() > 5000 { output = format!("{}\n[Truncated]", &output[..5000]); }
 
             tx_app.send(AppEvent::CommandEnd(output.clone())).await?;
             current_prompt = format!("Output:\n{}\nDone?", output);
         } else {
-            break;
+            if filter.full_buffer.trim().is_empty() {
+                 tx_app.send(AppEvent::Error("Empty response from agent".to_string())).await?;
+                 break;
+            }
+             break;
         }
     }
     Ok(())

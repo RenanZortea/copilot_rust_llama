@@ -1,6 +1,6 @@
 use crate::agent::{run_agent_loop, AgentConfig};
 use crate::shell::ShellRequest;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -12,7 +12,7 @@ pub enum AppMode {
 }
 
 #[derive(Clone)]
-pub enum MessageRole { User, Assistant, System, Error }
+pub enum MessageRole { User, Assistant, System, Error, Thinking }
 
 #[derive(Clone)]
 pub struct ChatMessage {
@@ -22,6 +22,7 @@ pub struct ChatMessage {
 
 pub enum AppEvent {
     Token(String),
+    Thinking(String), // New event for thinking stream
     AgentFinished,
     CommandStart(String),
     CommandEnd(String),
@@ -42,7 +43,6 @@ pub struct App {
     pub term_scroll: ListState,
     
     pub is_processing: bool,
-    // CHANGED: Store the handle so we can kill it
     pub agent_task: Option<JoinHandle<()>>, 
     
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -63,11 +63,19 @@ impl App {
             terminal_lines: vec![String::from("--- Shell Connected ---")],
             term_scroll: ListState::default(),
             is_processing: false,
-            agent_task: None, // Initialize empty
+            agent_task: None,
             
             event_tx,
             shell_tx,
             spinner_frame: 0,
+        }
+    }
+
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            _ => {}
         }
     }
 
@@ -79,7 +87,6 @@ impl App {
                     AppMode::Terminal => AppMode::Chat,
                 };
             }
-            // CHANGED: Esc to Cancel
             KeyCode::Esc if self.is_processing => {
                 self.abort_agent();
             }
@@ -102,7 +109,6 @@ impl App {
         }
     }
 
-    // New helper to kill the task
     fn abort_agent(&mut self) {
         if let Some(task) = self.agent_task.take() {
             task.abort();
@@ -118,21 +124,58 @@ impl App {
     pub fn handle_internal_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Tick => if self.is_processing { self.spinner_frame = self.spinner_frame.wrapping_add(1); },
+            
+            // Handle regular tokens (Answer)
             AppEvent::Token(t) => {
-                if let Some(last) = self.messages.last_mut() {
-                    if let MessageRole::Assistant = last.role { last.content.push_str(&t); }
+                // If the last message was Thinking, we start a NEW Assistant message
+                // If the last message was Assistant, we append.
+                let start_new = if let Some(last) = self.messages.last() {
+                    !matches!(last.role, MessageRole::Assistant)
                 } else {
+                    true
+                };
+
+                if start_new {
                     self.messages.push(ChatMessage { role: MessageRole::Assistant, content: t });
+                } else {
+                    if let Some(last) = self.messages.last_mut() {
+                        last.content.push_str(&t);
+                    }
                 }
                 self.chat_stick_to_bottom = true;
             }
+
+            // Handle thinking tokens
+            AppEvent::Thinking(t) => {
+                 let start_new = if let Some(last) = self.messages.last() {
+                    !matches!(last.role, MessageRole::Thinking)
+                } else {
+                    true
+                };
+
+                if start_new {
+                    self.messages.push(ChatMessage { role: MessageRole::Thinking, content: t });
+                } else {
+                    if let Some(last) = self.messages.last_mut() {
+                        last.content.push_str(&t);
+                    }
+                }
+                self.chat_stick_to_bottom = true;
+            }
+
             AppEvent::CommandStart(c) => {
                 self.messages.push(ChatMessage { role: MessageRole::System, content: c });
                 self.chat_stick_to_bottom = true;
             },
             AppEvent::TerminalLine(l) => {
+                let was_at_bottom = self.term_scroll.selected()
+                    .map_or(true, |s| s >= self.terminal_lines.len().saturating_sub(1));
+
                 self.terminal_lines.push(l);
-                self.term_scroll.select(Some(self.terminal_lines.len().saturating_sub(1)));
+                
+                if was_at_bottom {
+                    self.term_scroll.select(Some(self.terminal_lines.len().saturating_sub(1)));
+                }
             },
             AppEvent::CommandEnd(o) => {
                 let s = if o.len() > 100 { format!("Out ({}b) -> Term", o.len()) } else { o };
@@ -141,7 +184,7 @@ impl App {
             },
             AppEvent::AgentFinished => {
                 self.is_processing = false;
-                self.agent_task = None; // clear handle
+                self.agent_task = None;
             },
             AppEvent::Error(e) => {
                 self.messages.push(ChatMessage { role: MessageRole::Error, content: e });
@@ -162,12 +205,12 @@ impl App {
                 self.is_processing = true;
                 self.chat_stick_to_bottom = true; 
                 self.messages.push(ChatMessage { role: MessageRole::User, content: text.clone() });
-                self.messages.push(ChatMessage { role: MessageRole::Assistant, content: String::new() });
+                // We do NOT push an empty Assistant message here anymore, 
+                // because the first response might be Thinking.
                 
                 let tx = self.event_tx.clone();
                 let shell = self.shell_tx.clone();
                 
-                // CHANGED: Capture the handle
                 let handle = tokio::spawn(async move {
                     if let Err(e) = run_agent_loop(AgentConfig::default(), text, tx.clone(), shell).await {
                         let _ = tx.send(AppEvent::Error(e.to_string())).await;

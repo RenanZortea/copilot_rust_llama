@@ -7,7 +7,7 @@ mod ui;
 use anyhow::Result;
 use app::{App, AppEvent};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,7 +22,8 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Enable Mouse Capture here so we can scroll
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -75,6 +76,8 @@ async fn main() -> Result<()> {
                             _ => app.handle_key_event(key),
                         }
                     }
+                    // Handle mouse events for scrolling
+                    Event::Mouse(mouse) => app.handle_mouse_event(mouse),
                     _ => {}
                 }
             }
@@ -82,7 +85,12 @@ async fn main() -> Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // Disable Mouse Capture on exit
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     Ok(())
