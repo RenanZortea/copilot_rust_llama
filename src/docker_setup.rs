@@ -1,17 +1,30 @@
 use anyhow::{anyhow, Result};
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CONTAINER_NAME: &str = "ollama_dev_env";
-const WORKSPACE_DIR: &str = "./workspace";
+
+// Helper to get the workspace path from ENV or default
+pub fn get_workspace_path() -> PathBuf {
+    match env::var("LLM_AGENT_WORKSPACE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => PathBuf::from("./workspace"),
+    }
+}
 
 pub fn ensure_docker_env() -> Result<()> {
+    let workspace_path = get_workspace_path();
+
     // 1. Create the workspace directory locally if it doesn't exist
-    if !Path::new(WORKSPACE_DIR).exists() {
-        fs::create_dir(WORKSPACE_DIR)?;
-        println!("Created local workspace directory at {}", WORKSPACE_DIR);
+    if !workspace_path.exists() {
+        fs::create_dir_all(&workspace_path)?;
+        println!("Created local workspace directory at {:?}", workspace_path);
     }
+
+    // We need the absolute path for Docker volume mounting
+    let abs_workspace = fs::canonicalize(&workspace_path)?;
 
     // 2. Check if container is already running
     let status = Command::new("docker")
@@ -33,12 +46,10 @@ pub fn ensure_docker_env() -> Result<()> {
             .args(["rm", "-f", CONTAINER_NAME])
             .output();
 
-        println!("Starting Docker Sandbox...");
+        println!("Starting Docker Sandbox mapped to: {:?}", abs_workspace);
 
         // 4. Run the container
-        let current_dir = std::env::current_dir()?;
-        let abs_workspace = current_dir.join("workspace");
-
+        // We use the absolute path resolved above
         let status = Command::new("docker")
             .arg("run")
             .arg("-d")
@@ -79,7 +90,7 @@ pub fn ensure_docker_env() -> Result<()> {
     };
 
     if needs_install {
-        println!("Installing Basic Tools + Rust... (This runs once)");
+        println!("Installing Basic Tools + Rust inside Docker... (This runs once)");
 
         // This command installs:
         // 1. curl, git, vim, wget, nano
@@ -94,7 +105,7 @@ pub fn ensure_docker_env() -> Result<()> {
             .status()?;
 
         if !setup.success() {
-            eprintln!("Warning: Failed to install tools.");
+            eprintln!("Warning: Failed to install tools inside Docker.");
         } else {
             println!("Tools installed successfully.");
         }

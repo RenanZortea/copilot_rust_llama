@@ -59,7 +59,9 @@ echo "Where should the Agent store its files?"
 echo "This folder will be shared with the Docker sandbox."
 
 read -e -p "Path (default: ./workspace): " USER_PATH
-[[ -z "$USER_PATH" ]] && USER_PATH="./workspace"
+if [ -z "$USER_PATH" ]; then
+    USER_PATH="./workspace"
+fi
 
 mkdir -p "$USER_PATH"
 FULL_PATH=$(realpath "$USER_PATH")

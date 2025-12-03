@@ -35,29 +35,38 @@ Before running the agent, ensure you have the following installed:
 
 ## 📦 Installation & Usage
 
-1.  **Clone the repository:**
+### Clone the repository
 
-    ```bash
-    git clone [https://github.com/renanzortea/copilot_rust_llama.git](https://github.com/renanzortea/copilot_rust_llama.git)
-    cd copilot_rust_llama
-    ```
+```bash
+git clone https://github.com/renanzortea/copilot_rust_llama.git
+cd copilot_rust_llama
+```
 
-2.  **Build and Run:**
+### Run the setup script
 
-    ```bash
-    cargo run --release
-    ```
+This script checks dependencies, creates your workspace, and builds the agent.
 
-    _On the first run, the application will automatically:_
-    - Create a `./workspace` directory.
-    - Spin up a Docker container named `ollama_dev_env`.
-    - Install necessary tools (curl, git, build-essential, rust) inside the container.
+```bash
+chmod +x setup.sh
+./setup.sh
+```
 
-3.  **Controls:**
-    - **Chat Mode**: Type your request and press `Enter`. Use `Alt+Enter` for newlines.
-    - **Switch Views**: Press `Tab` to toggle between the **Agent Chat** and the **Terminal** view.
-    - **Scroll**: `Up`/`Down` arrows or `PageUp`/`PageDown`.
-    - **Exit**: `Ctrl+C`.
+Follow the prompts to select your workspace folder.
+
+### Start the agent
+
+The setup script creates a wrapper called `run_agent.sh` containing your configuration.
+
+```bash
+./run_agent.sh
+```
+
+**Controls:**
+
+- **Chat Mode**: Type your request and press `Enter`. Use `Alt+Enter` for newlines.
+- **Switch Views**: Press `Tab` to toggle between the **Agent Chat** and the **Terminal** view.
+- **Scroll**: `Up`/`Down` arrows or `PageUp`/`PageDown`.
+- **Exit**: `Ctrl+C`.
 
 ## 🏗️ Architecture
 
@@ -83,6 +92,7 @@ Currently, configuration is handled via code constants:
 - [ ] **Config File**: Move model configuration to a `config.toml` or environment variables.
 - [ ] **Syntax Highlighting**: Improve code block rendering in the chat UI.
 - [ ] **Session History**: Save and load chat history.
+- [ ] **Cloud Models**: Switch to cloud models like Gemini, ChatGPT, or Claude.
 
 ## 📄 License
 

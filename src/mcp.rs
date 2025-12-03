@@ -1,10 +1,11 @@
 use crate::shell::ShellRequest;
 use anyhow::Result;
 use regex::Regex;
-use scraper::{Html, Selector}; // New Import
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 // --- MCP Protocol Definitions ---
@@ -31,18 +32,26 @@ pub enum McpRequest {
 pub struct McpServer {
     shell_tx: mpsc::Sender<ShellRequest>,
     http_client: reqwest::Client,
+    workspace_root: PathBuf, // New field to store the configured workspace
 }
 
 impl McpServer {
     pub async fn start(shell_tx: mpsc::Sender<ShellRequest>) -> mpsc::Sender<McpRequest> {
         let (tx, mut rx) = mpsc::channel(32);
         
+        // Determine workspace root once at startup
+        let workspace_root = match env::var("LLM_AGENT_WORKSPACE") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => PathBuf::from("./workspace"), // Fallback relative path
+        };
+
         let mut server = Self { 
             shell_tx,
             http_client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            workspace_root,
         };
 
         tokio::spawn(async move {
@@ -148,14 +157,20 @@ impl McpServer {
             "write_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing path"))?;
                 let content = args.get("content").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing content"))?;
-                let target = Path::new("workspace").join(path);
+                
+                // Join with the configured workspace root
+                let target = self.workspace_root.join(path);
+                
                 if let Some(p) = target.parent() { tokio::fs::create_dir_all(p).await?; }
                 tokio::fs::write(&target, content).await?;
                 Ok(format!("Successfully wrote to {}", path))
             }
             "read_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing path"))?;
-                let target = Path::new("workspace").join(path);
+                
+                // Join with the configured workspace root
+                let target = self.workspace_root.join(path);
+                
                 if !target.exists() { return Ok(format!("File not found: {}", path)); }
                 let content = tokio::fs::read_to_string(target).await?;
                 if content.lines().count() > 300 {
@@ -165,7 +180,15 @@ impl McpServer {
             }
             "list_files" => {
                 let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let target = Path::new("workspace").join(path_str);
+                
+                // Join with the configured workspace root
+                let target = self.workspace_root.join(path_str);
+                
+                // Safety check: Ensure target exists
+                if !target.exists() {
+                     return Ok(format!("Directory not found: {}", path_str));
+                }
+
                 let mut entries = tokio::fs::read_dir(target).await?;
                 let mut list = Vec::new();
                 while let Some(entry) = entries.next_entry().await? {
@@ -180,7 +203,6 @@ impl McpServer {
                 let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing url"))?;
                 let resp = self.http_client.get(url).send().await?.text().await?;
                 
-                // Keep the simple regex cleaner for fetching raw page content as full parsing is overkill just for text
                 let re_script = Regex::new(r"(?si)<script.*?>.*?</script>").unwrap();
                 let re_style = Regex::new(r"(?si)<style.*?>.*?</style>").unwrap();
                 let re_tags = Regex::new(r"<[^>]*>").unwrap();
@@ -195,19 +217,14 @@ impl McpServer {
             "web_search" => {
                 let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing query"))?;
                 
-                // DuckDuckGo HTML endpoint
                 let params = [("q", query)];
                 let resp = self.http_client.post("https://html.duckduckgo.com/html/")
                     .form(&params)
                     .send().await?
                     .text().await?;
 
-                // Use SCRAPER crate for robust parsing
                 let document = Html::parse_document(&resp);
-                
-                // CSS Selector for result links
                 let link_selector = Selector::parse(".result__a").unwrap();
-                
                 let mut results = Vec::new();
 
                 for element in document.select(&link_selector).take(10) {
