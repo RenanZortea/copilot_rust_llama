@@ -2,9 +2,11 @@ mod agent;
 mod app;
 mod config;
 mod docker_setup;
+mod markdown;
 mod mcp;
+mod session;
 mod shell;
-mod ui;
+mod ui; // Registered new module
 
 use anyhow::Result;
 use app::{App, AppEvent};
@@ -22,21 +24,18 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Load Configuration
     let config = Config::load()?;
-
-    // 2. Ensure Docker Env using Config
     docker_setup::ensure_docker_env(&config)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // Mouse Capture Enabled for scrolling
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (tx_app_event, mut rx_app_event) = mpsc::channel::<AppEvent>(100);
 
-    // --- Shell Actor ---
     let (tx_shell, rx_shell) = mpsc::channel::<ShellRequest>(100);
     let tx_shell_for_app = tx_shell.clone();
     let tx_shell_evt = tx_app_event.clone();
@@ -45,11 +44,8 @@ async fn main() -> Result<()> {
         ShellSession::run_actor(rx_shell, tx_shell_evt).await;
     });
 
-    // --- MCP Server (Tool Host) ---
-    // Pass config to MCP so it knows where the workspace is
     let tx_mcp = McpServer::start(tx_shell, config.clone()).await;
 
-    // --- Input & Ticking ---
     let (tx_key_event, mut rx_key_event) = mpsc::unbounded_channel();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(50)).expect("Poll failed") {
@@ -72,8 +68,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // --- App Initialization ---
-    // Pass config to App so Agent knows which model to use
     let mut app = App::new(tx_app_event.clone(), tx_shell_for_app, tx_mcp, config);
 
     loop {

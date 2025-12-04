@@ -1,204 +1,105 @@
 use crate::app::{App, AppMode, MessageRole};
+use crate::markdown::render_markdown; // Import the new renderer
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Padding, Paragraph}, // Removed Wrap
+    widgets::{Block, Borders, List, ListItem, Padding, Paragraph},
     Frame,
 };
-use textwrap::wrap;
 
-// --- Theme / Color Palette (Codex / GitHub Dark Dimmed Style) ---
-const BG_MAIN: Color = Color::Rgb(13, 17, 23); // #0d1117 (Deep Navy)
-const BG_SIDEBAR: Color = Color::Rgb(22, 27, 34); // #161b22 (Lighter Navy)
-const BORDER_COLOR: Color = Color::Rgb(48, 54, 61); // #30363d (Subtle Gray)
-const FG_PRIMARY: Color = Color::Rgb(201, 209, 217); // #c9d1d9 (Soft White)
-const FG_SECONDARY: Color = Color::Rgb(139, 148, 158); // #8b949e (Dimmed Gray)
-const ACCENT_CYAN: Color = Color::Rgb(88, 166, 255); // #58a6ff (Bright Blue/Cyan)
-const ACCENT_GREEN: Color = Color::Rgb(63, 185, 80); // #3fb950 (Success Green)
-const ACCENT_RED: Color = Color::Rgb(248, 81, 73); // #f85149 (Error Red)
-const CODE_COLOR: Color = Color::Rgb(255, 123, 114); // #ff7b72 (Code Pinkish)
-
-// Braille pattern for a rotating circle effect
+// --- Theme / Color Palette ---
+const BG_MAIN: Color = Color::Rgb(13, 17, 23);
+const BG_SIDEBAR: Color = Color::Rgb(22, 27, 34);
+const BORDER_COLOR: Color = Color::Rgb(48, 54, 61);
+const FG_PRIMARY: Color = Color::Rgb(201, 209, 217);
+const FG_SECONDARY: Color = Color::Rgb(139, 148, 158);
+const ACCENT_CYAN: Color = Color::Rgb(88, 166, 255);
+const ACCENT_GREEN: Color = Color::Rgb(63, 185, 80);
+const ACCENT_RED: Color = Color::Rgb(248, 81, 73);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    f.render_widget(Block::default().bg(BG_MAIN), area);
 
-    // 1. Global Background
-    let bg_block = Block::default().bg(BG_MAIN);
-    f.render_widget(bg_block, area);
-
-    // 2. Main Split: Sidebar (Left) vs Content (Right)
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(32), // Fixed sidebar width
-            Constraint::Min(1),     // Fluid content width
-        ])
+        .constraints([Constraint::Length(32), Constraint::Min(1)])
         .split(area);
 
-    let sidebar_area = main_layout[0];
-    let content_area = main_layout[1];
-
-    draw_sidebar(f, app, sidebar_area);
-    draw_main_content(f, app, content_area);
+    draw_sidebar(f, app, main_layout[0]);
+    draw_main_content(f, app, main_layout[1]);
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    // Sidebar Background
     let sidebar_block = Block::default()
         .bg(BG_SIDEBAR)
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(BORDER_COLOR));
     f.render_widget(sidebar_block.clone(), area);
-
     let inner_area = sidebar_block.inner(area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8), // Header Box (Codex Style)
-            Constraint::Length(2), // Spacer
-            Constraint::Min(1),    // Navigation / History
-            Constraint::Length(3), // Footer Status
-        ])
+        .constraints([Constraint::Length(8), Constraint::Length(2), Constraint::Min(1), Constraint::Length(3)])
         .split(inner_area);
 
-    // --- 1. Codex Header Box ---
-    // Mimics the ">_ OpenAI Codex" box from the reference
+    // Header
     let header_text = vec![
         Line::from(vec![
-            Span::styled(
-                ">_ ",
-                Style::default()
-                    .fg(ACCENT_GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Agerus Agent",
-                Style::default().fg(FG_PRIMARY).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(">_ ", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("Agerus Agent", Style::default().fg(FG_PRIMARY).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(""), // Spacer
+        Line::from(""),
         Line::from(vec![
             Span::styled("model: ", Style::default().fg(FG_SECONDARY)),
             Span::styled(app.config.model.clone(), Style::default().fg(ACCENT_CYAN)),
         ]),
         Line::from(vec![
             Span::styled("cwd:   ", Style::default().fg(FG_SECONDARY)),
-            // Truncate workspace path for visual cleanliness
-            Span::styled(
-                app.config
-                    .workspace_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                Style::default().fg(FG_PRIMARY),
-            ),
+            Span::styled(app.config.workspace_path.file_name().unwrap_or_default().to_string_lossy(), Style::default().fg(FG_PRIMARY)),
         ]),
     ];
+    f.render_widget(Paragraph::new(header_text).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(BORDER_COLOR)).padding(Padding::new(1, 1, 1, 1))), chunks[0]);
 
-    let header_box = Paragraph::new(header_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BORDER_COLOR))
-            .padding(Padding::new(1, 1, 1, 1)),
-    );
-    f.render_widget(header_box, chunks[0]);
-
-    // --- 2. Navigation ---
-    let active_style = Style::default()
-        .fg(ACCENT_CYAN)
-        .add_modifier(Modifier::BOLD);
-    let inactive_style = Style::default().fg(FG_SECONDARY);
-
+    // Navigation
+    let active = Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(FG_SECONDARY);
     let nav_items = vec![
-        ListItem::new(if app.mode == AppMode::Chat {
-            "● Chat"
-        } else {
-            "○ Chat"
-        })
-        .style(if app.mode == AppMode::Chat {
-            active_style
-        } else {
-            inactive_style
-        }),
-        ListItem::new(if app.mode == AppMode::Terminal {
-            "● Terminal"
-        } else {
-            "○ Terminal"
-        })
-        .style(if app.mode == AppMode::Terminal {
-            active_style
-        } else {
-            inactive_style
-        }),
+        ListItem::new(if app.mode == AppMode::Chat { "● Chat" } else { "○ Chat" }).style(if app.mode == AppMode::Chat { active } else { inactive }),
+        ListItem::new(if app.mode == AppMode::Terminal { "● Terminal" } else { "○ Terminal" }).style(if app.mode == AppMode::Terminal { active } else { inactive }),
         ListItem::new(""),
-        ListItem::new(Line::from(vec![Span::styled(
-            "Commands:",
-            Style::default()
-                .fg(FG_SECONDARY)
-                .add_modifier(Modifier::UNDERLINED),
-        )])),
-        ListItem::new(Line::from(vec![
-            Span::styled("/init", Style::default().fg(FG_PRIMARY)),
-            Span::raw(" - setup workspace"),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("/reset", Style::default().fg(FG_PRIMARY)),
-            Span::raw(" - clear chat"),
-        ])),
+        ListItem::new(Line::from(vec![Span::styled("Session:", Style::default().fg(FG_SECONDARY).add_modifier(Modifier::UNDERLINED))])),
+        ListItem::new(Line::from(Span::styled(&app.current_session, Style::default().fg(ACCENT_GREEN)))),
+        ListItem::new(""),
+        ListItem::new(Line::from(vec![Span::styled("Commands:", Style::default().fg(FG_SECONDARY).add_modifier(Modifier::UNDERLINED))])),
+        ListItem::new(Line::from(vec![Span::styled("/new", Style::default().fg(FG_PRIMARY)), Span::raw(" - New Chat")])),
+        ListItem::new(Line::from(vec![Span::styled("/load", Style::default().fg(FG_PRIMARY)), Span::raw(" - Load Chat")])),
+        ListItem::new(Line::from(vec![Span::styled("/list", Style::default().fg(FG_PRIMARY)), Span::raw(" - List Chats")])),
     ];
+    f.render_widget(List::new(nav_items).block(Block::default().padding(Padding::horizontal(1))), chunks[2]);
 
-    let nav_list = List::new(nav_items).block(Block::default().padding(Padding::horizontal(1)));
-    f.render_widget(nav_list, chunks[2]);
-
-    // --- 3. Flashing Footer Status (Animation only) ---
+    // Footer
     let (symbol, style) = if app.is_processing {
-        let frame_idx = app.spinner_frame % SPINNER.len();
-        (
-            SPINNER[frame_idx],
-            Style::default()
-                .fg(ACCENT_CYAN)
-                .add_modifier(Modifier::BOLD),
-        )
+        (SPINNER[app.spinner_frame % SPINNER.len()], Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD))
     } else {
-        ("●", Style::default().fg(ACCENT_GREEN)) // Static filled circle when idle
+        ("●", Style::default().fg(ACCENT_GREEN))
     };
-
-    let footer = Paragraph::new(Line::from(Span::styled(symbol, style))).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER_COLOR))
-            .padding(Padding::new(1, 1, 0, 0)),
-    );
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(symbol, style))).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(BORDER_COLOR)).padding(Padding::new(1, 1, 0, 0))), chunks[3]);
 }
 
 fn draw_main_content(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // Chat Area
-            Constraint::Length(1), // Separator Line
-            Constraint::Length(3), // Input Area (Fixed height like a prompt)
-        ])
+    let chunks = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(3)])
         .split(area);
 
-    // 1. View Area (Chat or Terminal)
     match app.mode {
         AppMode::Chat => draw_chat_view(f, app, chunks[0]),
         AppMode::Terminal => draw_terminal_view(f, app, chunks[0]),
     }
 
-    // 2. Separator
-    let separator = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(BORDER_COLOR));
-    f.render_widget(separator, chunks[1]);
-
-    // 3. Input Area
+    f.render_widget(Block::default().borders(Borders::TOP).border_style(Style::default().fg(BORDER_COLOR)), chunks[1]);
     draw_input_bar(f, app, chunks[2]);
 }
 
@@ -206,206 +107,78 @@ fn draw_chat_view(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().padding(Padding::new(2, 2, 1, 1));
     f.render_widget(block.clone(), area);
     let inner_area = block.inner(area);
-
     let max_width = inner_area.width as usize;
     let mut lines = vec![];
 
     for msg in &app.messages {
         match msg.role {
             MessageRole::System => {
-                lines.push(Line::from(Span::styled(
-                    format!("  >> {}", msg.content),
-                    Style::default().fg(FG_SECONDARY),
-                )));
+                // System messages are simple text
+                lines.push(Line::from(Span::styled(format!("  >> {}", msg.content), Style::default().fg(FG_SECONDARY))));
             }
             MessageRole::Thinking => {
-                lines.push(Line::from(vec![Span::styled(
-                    "  ⚡ Thinking...",
-                    Style::default()
-                        .fg(FG_SECONDARY)
-                        .add_modifier(Modifier::ITALIC),
-                )]));
-                // Indent thinking content
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(
-                            line,
-                            Style::default()
-                                .fg(FG_SECONDARY)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
+                // Render thinking with Markdown too, but styled as Italic/Dim
+                lines.push(Line::from(vec![Span::styled("  ⚡ Thinking...", Style::default().fg(FG_SECONDARY).add_modifier(Modifier::ITALIC))]));
+                
+                // We use a narrower width for thinking blocks to indent them
+                let think_width = max_width.saturating_sub(4);
+                let base_style = Style::default().fg(FG_SECONDARY).add_modifier(Modifier::ITALIC);
+                
+                // Render using the new markdown engine
+                let rendered = render_markdown(&msg.content, think_width, base_style);
+                
+                for line in rendered {
+                    // Prepend indentation
+                    let mut spans = vec![Span::raw("    ")];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
                 }
             }
             _ => {
-                // Header: "User" or "Agent"
-                let (name, style) = if matches!(msg.role, MessageRole::User) {
-                    (
-                        "User",
-                        Style::default()
-                            .fg(ACCENT_GREEN)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else if matches!(msg.role, MessageRole::Error) {
-                    (
-                        "Error",
-                        Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    (
-                        "Agerus",
-                        Style::default()
-                            .fg(ACCENT_CYAN)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                // Header
+                let (name, style, color) = match msg.role {
+                    MessageRole::User => ("User", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD), FG_PRIMARY),
+                    MessageRole::Error => ("Error", Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD), ACCENT_RED),
+                    _ => ("Agerus", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD), FG_PRIMARY),
                 };
-
                 lines.push(Line::from(vec![
                     Span::styled(format!("{} ", name), style),
-                    Span::styled(
-                        chrono::Local::now().format("%H:%M").to_string(),
-                        Style::default().fg(FG_SECONDARY),
-                    ),
+                    Span::styled(chrono::Local::now().format("%H:%M").to_string(), Style::default().fg(FG_SECONDARY)),
                 ]));
 
-                // Content
-                let content_color = if matches!(msg.role, MessageRole::Error) {
-                    ACCENT_RED
+                // Content - Render with Markdown!
+                if matches!(msg.role, MessageRole::Error) {
+                    // Errors usually raw text
+                    lines.push(Line::from(Span::styled(&msg.content, Style::default().fg(color))));
                 } else {
-                    FG_PRIMARY
-                };
-                let mut in_code_block = false;
-
-                for line in msg.content.lines() {
-                    let wrapped = wrap(line, max_width);
-                    if wrapped.is_empty() {
-                        lines.push(Line::from(""));
-                    }
-
-                    for w_line in wrapped {
-                        let (parsed_line, new_state) =
-                            parse_markdown_line(&w_line, in_code_block, content_color);
-                        in_code_block = new_state;
-                        lines.push(parsed_line);
-                    }
+                    let base_style = Style::default().fg(color);
+                    let rendered = render_markdown(&msg.content, max_width, base_style);
+                    lines.extend(rendered);
                 }
             }
         }
-        lines.push(Line::from("")); // Margin between messages
+        lines.push(Line::from("")); // Margin
     }
 
-    // Stick to bottom logic
-    let total_height = lines.len() as u16;
-    let view_height = inner_area.height;
     let scroll = if app.chat_stick_to_bottom {
-        if total_height > view_height {
-            total_height - view_height
-        } else {
-            0
-        }
+        (lines.len() as u16).saturating_sub(inner_area.height)
     } else {
         app.chat_scroll
     };
-
-    let paragraph = Paragraph::new(lines).scroll((scroll, 0));
-    f.render_widget(paragraph, inner_area);
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner_area);
 }
 
 fn draw_terminal_view(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .terminal_lines
-        .iter()
-        .map(|l| ListItem::new(Line::from(Span::styled(l, Style::default().fg(FG_PRIMARY)))))
-        .collect();
-
-    let list = List::new(items).block(Block::default().padding(Padding::new(1, 1, 1, 1)));
-
+    let items: Vec<ListItem> = app.terminal_lines.iter().map(|l| ListItem::new(Line::from(Span::styled(l, Style::default().fg(FG_PRIMARY))))).collect();
     let mut state = app.term_scroll.clone();
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(List::new(items).block(Block::default().padding(Padding::new(1, 1, 1, 1))), area, &mut state);
 }
 
 fn draw_input_bar(f: &mut Frame, app: &App, area: Rect) {
-    // A clean prompts line: "> [Input]"
-    let prompt_symbol = "> ";
-    let prompt_style = if app.mode == AppMode::Chat {
-        Style::default()
-            .fg(ACCENT_CYAN)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(ACCENT_GREEN)
-            .add_modifier(Modifier::BOLD)
-    };
-
-    let input_text = vec![
-        Span::styled(prompt_symbol, prompt_style),
-        Span::styled(app.input_buffer.as_str(), Style::default().fg(FG_PRIMARY)),
-        // Blinking cursor simulation could go here if we manually rendered it,
-        // but Ratatui handles the terminal cursor position via `f.set_cursor` usually.
-        // For visual block cursor:
+    let (prompt, style) = if app.mode == AppMode::Chat { ("> ", Style::default().fg(ACCENT_CYAN)) } else { ("> ", Style::default().fg(ACCENT_GREEN)) };
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(prompt, style.add_modifier(Modifier::BOLD)),
+        Span::styled(&app.input_buffer, Style::default().fg(FG_PRIMARY)),
         Span::styled("▋", Style::default().fg(FG_SECONDARY)),
-    ];
-
-    let p = Paragraph::new(Line::from(input_text))
-        .block(Block::default().padding(Padding::horizontal(1))); // No borders, just clean text
-    f.render_widget(p, area);
-}
-
-// --- Helpers ---
-
-fn parse_markdown_line(
-    line: &str,
-    in_code_block: bool,
-    base_color: Color,
-) -> (Line<'static>, bool) {
-    // 1. Code Fences
-    if line.trim().starts_with("```") {
-        return (
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(FG_SECONDARY),
-            )),
-            !in_code_block,
-        );
-    }
-
-    // 2. Inside Code Block
-    if in_code_block {
-        return (
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(CODE_COLOR),
-            )),
-            true,
-        );
-    }
-
-    // 3. Regular Text Parsing (Bold headers, bullet points)
-    let style = Style::default().fg(base_color);
-
-    // Headers (# )
-    if line.starts_with("# ") || line.starts_with("## ") {
-        return (
-            Line::from(Span::styled(
-                line.to_string(),
-                style.add_modifier(Modifier::BOLD).fg(ACCENT_CYAN),
-            )),
-            false,
-        );
-    }
-
-    // Bold text (**...**) - Simple split parser
-    let parts: Vec<&str> = line.split("**").collect();
-    let mut spans = vec![];
-    for (i, part) in parts.iter().enumerate() {
-        let s = if i % 2 == 1 {
-            style.add_modifier(Modifier::BOLD).fg(Color::White)
-        } else {
-            style
-        };
-        spans.push(Span::styled(part.to_string(), s));
-    }
-
-    (Line::from(spans), false)
+    ])).block(Block::default().padding(Padding::horizontal(1))), area);
 }
