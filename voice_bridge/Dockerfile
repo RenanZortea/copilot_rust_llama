@@ -1,6 +1,7 @@
-FROM python:3.11-slim
+# Use a valid PyTorch image with CUDA 12.4 and CuDNN 9 (Devel version for compilation)
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
-# Install system dependencies required for VibeVoice audio processing
+# Install system audio/video libraries
 RUN apt-get update && apt-get install -y \
     git \
     libsndfile1 \
@@ -10,21 +11,18 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Clone the Community Fork (Better compatibility)
-RUN git clone https://github.com/JarodMica/VibeVoice.git .
+# 1. Install Flash Attention (Critical for VibeVoice)
+# We do this first because it takes time to compile
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
-# Patch dependencies to remove flash-attn (prevents build failure on generic hardware)
-# and relax python version constraints
-RUN sed -i 's/==3.11.12/>=3.10/g' pyproject.toml && \
-    sed -i '/flash-attn/d' pyproject.toml
+# 2. Clone the OFFICIAL Microsoft VibeVoice repository
+RUN git clone https://github.com/microsoft/VibeVoice.git .
 
-# Install Python Dependencies
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir "numpy<2" && \
-    pip install --no-cache-dir fastapi uvicorn requests soundfile torch huggingface_hub
+# 3. Install the repo in editable mode
+RUN pip install --no-cache-dir -e .
 
-# Install the repo itself
-RUN pip install -e .
+# 4. Install additional server requirements
+RUN pip install --no-cache-dir fastapi uvicorn requests soundfile
 
 # Copy our server script
 COPY server.py .
