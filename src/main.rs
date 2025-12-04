@@ -1,12 +1,13 @@
 mod agent;
 mod app;
+mod audio; // Register audio module
 mod config;
 mod docker_setup;
 mod markdown;
 mod mcp;
 mod session;
 mod shell;
-mod ui; // Registered new module
+mod ui;
 
 use anyhow::Result;
 use app::{App, AppEvent};
@@ -29,7 +30,6 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse Capture Enabled for scrolling
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
 
     let tx_mcp = McpServer::start(tx_shell, config.clone()).await;
 
+    // Input loop
     let (tx_key_event, mut rx_key_event) = mpsc::unbounded_channel();
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(50)).expect("Poll failed") {
@@ -57,6 +58,7 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Tick loop
     let tx_tick = tx_app_event.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(80));

@@ -1,4 +1,5 @@
 use crate::app::{AppEvent, MessageRole};
+use crate::audio::AudioPlayer; // Import
 use crate::config::Config;
 use crate::mcp::{McpRequest, ToolDefinition};
 use anyhow::Result;
@@ -10,33 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_LOOPS: usize = 10;
 
-// --- ROBUST SYSTEM PROMPT ---
-const AGENT_SYSTEM_PROMPT: &str = r#"
-You are Agerus, an expert software development agent running in a secure Docker sandbox.
-
-# CRITICAL OPERATIONAL RULES:
-1. **CONTEXT IS KING**: 
-   - You have NO magic knowledge of the user's files.
-   - ALWAYS run `list_files` to explore the directory structure first.
-   - ALWAYS run `read_file` to see file content before editing.
-   - ALWAYS run `consult_documentation` to see the documentation for the language.
-
-2. **SANDBOXED ENVIRONMENT**:
-   - You are running inside a Docker container.
-   - You can safely run destructive commands (rm, etc) if necessary.
-   - You cannot open GUI applications.
-
-3. **THINK BEFORE ACTING**:
-   - Before calling a tool, briefly explain your plan.
-   - If a tool fails, analyze the error and try a different approach.
-
-4. **FORMATTING**:
-   - When writing code, return the full file content if the file is small.
-   - For large files, ensure you have read them first to avoid overwriting content blindly.
-"#;
-
-// --- Ollama API Structures ---
-
+// ... (Keep existing structs and SYSTEM_PROMPT) ...
+// (Retain ChatResponse, Message, ToolCall, ToolFunction structs)
 #[derive(Deserialize, Debug)]
 struct ChatResponse {
     message: Option<Message>,
@@ -65,7 +41,25 @@ struct ToolFunction {
     arguments: serde_json::Value,
 }
 
-// --- The Agent Logic ---
+const AGENT_SYSTEM_PROMPT: &str = r#"
+You are Agerus, an expert software development agent running in a secure Docker sandbox.
+# CRITICAL OPERATIONAL RULES:
+1. **CONTEXT IS KING**: 
+   - You have NO magic knowledge of the user's files.
+   - ALWAYS run `list_files` to explore the directory structure first.
+   - ALWAYS run `read_file` to see file content before editing.
+   - ALWAYS run `consult_documentation` to see the documentation for the language.
+2. **SANDBOXED ENVIRONMENT**:
+   - You are running inside a Docker container.
+   - You can safely run destructive commands (rm, etc) if necessary.
+   - You cannot open GUI applications.
+3. **THINK BEFORE ACTING**:
+   - Before calling a tool, briefly explain your plan.
+   - If a tool fails, analyze the error and try a different approach.
+4. **FORMATTING**:
+   - When writing code, return the full file content if the file is small.
+   - For large files, ensure you have read them first to avoid overwriting content blindly.
+"#;
 
 pub async fn run_agent_loop(
     config: Config,
@@ -73,6 +67,9 @@ pub async fn run_agent_loop(
     app_tx: mpsc::Sender<AppEvent>,
     mcp_tx: mpsc::Sender<McpRequest>,
 ) -> Result<()> {
+    // --- SETUP AUDIO ---
+    let audio = AudioPlayer::new(config.voice_server_url.clone(), config.voice_enabled);
+
     // 1. Fetch Tools from MCP Server
     let (tx, rx) = oneshot::channel();
     if let Err(e) = mcp_tx.send(McpRequest::ListTools(tx)).await {
@@ -107,7 +104,6 @@ pub async fn run_agent_loop(
         .collect();
 
     // 2. CONSTRUCT MESSAGE HISTORY
-    // We start with the forceful system prompt, then append the user's history.
     let mut messages = vec![json!({
         "role": "system",
         "content": AGENT_SYSTEM_PROMPT
@@ -118,16 +114,13 @@ pub async fn run_agent_loop(
         .map(|msg| {
             let role = match msg.role {
                 MessageRole::User => "user",
-                // Thinking blocks are internal UI states, usually mapped to assistant for context
                 MessageRole::Assistant | MessageRole::Thinking => "assistant",
-                // System logs in UI (like "File saved") are mapped to user or system. 
-                // Mapping to "user" often helps the model see it as an observation.
                 MessageRole::System | MessageRole::Error => "system",
             };
             json!({ "role": role, "content": msg.content })
         })
         .collect();
-    
+
     messages.extend(history_json);
 
     let client = Client::new();
@@ -149,20 +142,16 @@ pub async fn run_agent_loop(
 
         let mut res = client.post(&config.ollama_url).json(&body).send().await;
 
-        // --- Fallback Logic ---
+        // Fallback Logic
         if let Ok(ref response) = res {
             if response.status() == reqwest::StatusCode::BAD_REQUEST {
-                app_tx.send(AppEvent::Thinking(format!(
-                    "Model '{}' rejected tools. Falling back to text-only mode.", 
-                    config.model
-                ))).await?;
-
-                body = json!({
-                    "model": config.model,
-                    "messages": messages,
-                    "stream": true
-                });
-                
+                app_tx
+                    .send(AppEvent::Thinking(format!(
+                        "Model '{}' rejected tools. Falling back to text-only mode.",
+                        config.model
+                    )))
+                    .await?;
+                body = json!({ "model": config.model, "messages": messages, "stream": true });
                 res = client.post(&config.ollama_url).json(&body).send().await;
             }
         }
@@ -203,7 +192,6 @@ pub async fn run_agent_loop(
                                 while let Some(pos) = buffer.find('\n') {
                                     let line = buffer[..pos].to_string();
                                     buffer.drain(..=pos);
-
                                     if line.trim().is_empty() {
                                         continue;
                                     }
@@ -218,53 +206,64 @@ pub async fn run_agent_loop(
                                                     )))
                                                     .await?;
                                             }
-
                                             if let Some(msg) = resp.message {
-                                                // Handle native thinking fields
                                                 if let Some(think) = msg.thinking {
                                                     if !think.is_empty() {
-                                                        app_tx.send(AppEvent::Thinking(think)).await?;
+                                                        app_tx
+                                                            .send(AppEvent::Thinking(think))
+                                                            .await?;
                                                     }
                                                 } else if let Some(reason) = msg.reasoning_content {
                                                     if !reason.is_empty() {
-                                                        app_tx.send(AppEvent::Thinking(reason)).await?;
+                                                        app_tx
+                                                            .send(AppEvent::Thinking(reason))
+                                                            .await?;
                                                     }
                                                 }
 
                                                 if let Some(content) = msg.content {
                                                     if !content.is_empty() {
                                                         let mut text = content.clone();
-                                                        
-                                                        // Parse <think> tags if model outputs them in content
                                                         if text.contains("<think>") {
                                                             parsing_thought = true;
                                                             text = text.replace("<think>", "");
                                                         }
-
                                                         if text.contains("</think>") {
                                                             parsing_thought = false;
                                                             let parts: Vec<&str> =
                                                                 text.split("</think>").collect();
                                                             if let Some(t) = parts.first() {
                                                                 if !t.is_empty() {
-                                                                    app_tx.send(AppEvent::Thinking(t.to_string())).await?;
+                                                                    app_tx
+                                                                        .send(AppEvent::Thinking(
+                                                                            t.to_string(),
+                                                                        ))
+                                                                        .await?;
                                                                 }
                                                             }
                                                             if parts.len() > 1 {
                                                                 let c = parts[1];
                                                                 if !c.is_empty() {
                                                                     full_content.push_str(c);
-                                                                    app_tx.send(AppEvent::Token(c.to_string())).await?;
+                                                                    app_tx
+                                                                        .send(AppEvent::Token(
+                                                                            c.to_string(),
+                                                                        ))
+                                                                        .await?;
                                                                 }
                                                             }
                                                             continue;
                                                         }
 
                                                         if parsing_thought {
-                                                            app_tx.send(AppEvent::Thinking(text)).await?;
+                                                            app_tx
+                                                                .send(AppEvent::Thinking(text))
+                                                                .await?;
                                                         } else {
                                                             full_content.push_str(&text);
-                                                            app_tx.send(AppEvent::Token(text)).await?;
+                                                            app_tx
+                                                                .send(AppEvent::Token(text))
+                                                                .await?;
                                                         }
                                                     }
                                                 }
@@ -279,6 +278,18 @@ pub async fn run_agent_loop(
                             }
                         }
                     }
+                }
+
+                // --- VOICE TRIGGER ---
+                // If we have content and no tools (it's a text response), speak it.
+                if !full_content.is_empty() && buffer_tools.is_empty() {
+                    let text_to_speak = full_content.clone();
+                    let audio_player =
+                        AudioPlayer::new(config.voice_server_url.clone(), config.voice_enabled);
+                    // Fire and forget audio so we don't block the loop
+                    tokio::spawn(async move {
+                        let _ = audio_player.play_text(&text_to_speak).await;
+                    });
                 }
 
                 if buffer_tools.is_empty() {
