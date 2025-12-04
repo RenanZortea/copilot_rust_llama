@@ -10,6 +10,31 @@ use tokio::sync::{mpsc, oneshot};
 
 const MAX_LOOPS: usize = 10;
 
+// --- ROBUST SYSTEM PROMPT ---
+const AGENT_SYSTEM_PROMPT: &str = r#"
+You are Agerus, an expert software development agent running in a secure Docker sandbox.
+
+# CRITICAL OPERATIONAL RULES:
+1. **CONTEXT IS KING**: 
+   - You have NO magic knowledge of the user's files.
+   - ALWAYS run `list_files` to explore the directory structure first.
+   - ALWAYS run `read_file` to see file content before editing.
+   - ALWAYS run `consult_documentation` to see the documentation for the language.
+
+2. **SANDBOXED ENVIRONMENT**:
+   - You are running in `/workspace` inside a Docker container.
+   - You can safely run destructive commands (rm, etc) if necessary.
+   - You cannot open GUI applications.
+
+3. **THINK BEFORE ACTING**:
+   - Before calling a tool, briefly explain your plan.
+   - If a tool fails, analyze the error and try a different approach.
+
+4. **FORMATTING**:
+   - When writing code, return the full file content if the file is small.
+   - For large files, ensure you have read them first to avoid overwriting content blindly.
+"#;
+
 // --- Ollama API Structures ---
 
 #[derive(Deserialize, Debug)]
@@ -81,17 +106,29 @@ pub async fn run_agent_loop(
         })
         .collect();
 
-    let mut messages: Vec<serde_json::Value> = history
+    // 2. CONSTRUCT MESSAGE HISTORY
+    // We start with the forceful system prompt, then append the user's history.
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": AGENT_SYSTEM_PROMPT
+    })];
+
+    let history_json: Vec<serde_json::Value> = history
         .iter()
         .map(|msg| {
             let role = match msg.role {
                 MessageRole::User => "user",
+                // Thinking blocks are internal UI states, usually mapped to assistant for context
                 MessageRole::Assistant | MessageRole::Thinking => "assistant",
+                // System logs in UI (like "File saved") are mapped to user or system. 
+                // Mapping to "user" often helps the model see it as an observation.
                 MessageRole::System | MessageRole::Error => "system",
             };
             json!({ "role": role, "content": msg.content })
         })
         .collect();
+    
+    messages.extend(history_json);
 
     let client = Client::new();
     let mut loops = 0;
@@ -113,14 +150,8 @@ pub async fn run_agent_loop(
         let mut res = client.post(&config.ollama_url).json(&body).send().await;
 
         // --- Fallback Logic ---
-        // If the request failed with 400 Bad Request, it usually means the model
-        // doesn't support the "tools" parameter. We retry without it.
         if let Ok(ref response) = res {
             if response.status() == reqwest::StatusCode::BAD_REQUEST {
-                // Read the error message to be sure (requires consuming, so we might need to clone or just assume)
-                // For simplicity, we assume 400 on chat endpoint = tools issue or bad prompt.
-                // Let's try stripping tools.
-                
                 app_tx.send(AppEvent::Thinking(format!(
                     "Model '{}' rejected tools. Falling back to text-only mode.", 
                     config.model
@@ -129,7 +160,6 @@ pub async fn run_agent_loop(
                 body = json!({
                     "model": config.model,
                     "messages": messages,
-                    // "tools": removed
                     "stream": true
                 });
                 
@@ -190,7 +220,7 @@ pub async fn run_agent_loop(
                                             }
 
                                             if let Some(msg) = resp.message {
-                                                // Handle native thinking fields (deepseek-r1 often uses reasoning_content)
+                                                // Handle native thinking fields
                                                 if let Some(think) = msg.thinking {
                                                     if !think.is_empty() {
                                                         app_tx.send(AppEvent::Thinking(think)).await?;

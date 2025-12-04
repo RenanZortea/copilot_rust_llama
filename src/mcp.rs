@@ -126,6 +126,18 @@ impl McpServer {
                             "required": ["query"]
                         }),
                     },
+                    // --- NEW TOOL HERE ---
+                    ToolDefinition {
+                        name: "consult_documentation".into(),
+                        description: "Lookup documentation/cheatsheets for commands or languages. Examples: 'rust/vectors', 'python/requests', 'tar', 'git/commit'.".into(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string", "description": "Subject to lookup (e.g. 'rust/hashmap' or 'tar')" }
+                            },
+                            "required": ["query"]
+                        }),
+                    },
                 ];
                 let _ = resp_tx.send(tools);
             }
@@ -232,6 +244,26 @@ impl McpServer {
                     Ok("No results found.".to_string())
                 } else {
                     Ok(results.join("\n---\n"))
+                }
+            }
+            // --- IMPLEMENTATION OF NEW TOOL ---
+            "consult_documentation" => {
+                let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing query"))?;
+                
+                // Format: https://cht.sh/{query}?T
+                // ?T tells cht.sh to strip styles, but sometimes it still sends ANSI codes.
+                let url = format!("https://cht.sh/{}?T", query);
+                
+                let resp = self.http_client.get(&url).send().await?.text().await?;
+
+                // Strip ANSI codes so the LLM gets clean text
+                let re_ansi = Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?m").unwrap();
+                let clean_text = re_ansi.replace_all(&resp, "").to_string();
+
+                if clean_text.len() > 8000 {
+                     Ok(format!("{}\n...[Documentation truncated]", &clean_text[..8000]))
+                } else {
+                     Ok(clean_text)
                 }
             }
             _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
